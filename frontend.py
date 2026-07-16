@@ -8,9 +8,11 @@ import itertools
 import uuid
 
 import streamlit as st
+from groq import RateLimitError
+from pydantic import ValidationError
 
-from BackEnd import app, get_thread_history, list_threads
-from rag import BACKEND, DOCUMENTS_DIR, ingest_pdf, list_documents
+from BackEnd import PatientProfile, app, delete_thread, get_thread_history
+from rag import BACKEND, DOCUMENTS_DIR, delete_document, ingest_pdf, list_documents
 
 st.set_page_config(page_title="MedAssist", page_icon="🩺", layout="centered")
 
@@ -25,9 +27,23 @@ PROFILE_DEFAULTS = {
 }
 
 
+def _register_thread(thread_id: str) -> None:
+    """Mark a thread as owned by this browser session.
+
+    Privacy: the checkpoint DB is shared by every visitor of a deployment,
+    so the sidebar must only ever list threads registered here — never the
+    global thread list.
+    """
+    threads = st.session_state.setdefault("my_threads", [])
+    if thread_id in threads:
+        threads.remove(thread_id)
+    threads.insert(0, thread_id)
+
+
 def _activate_thread(thread_id: str) -> None:
     """Switch to a conversation and restore its full history."""
     st.session_state.thread_id = thread_id
+    _register_thread(thread_id)
     st.session_state.chat_history = [
         {
             "role": msg["role"],
@@ -49,6 +65,7 @@ if "thread_id" not in st.session_state:
     else:
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.chat_history = []
+        _register_thread(st.session_state.thread_id)
 
 # Keep the thread in the URL so a page refresh stays in the same conversation.
 st.query_params["thread"] = st.session_state.thread_id
@@ -62,6 +79,8 @@ def _new_chat() -> None:
     """Start a fresh thread and reset the patient profile."""
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.chat_history = []
+    st.session_state.patient = {}
+    _register_thread(st.session_state.thread_id)
     for key, default in PROFILE_DEFAULTS.items():
         st.session_state[key] = default
 
@@ -69,6 +88,16 @@ def _new_chat() -> None:
 def _load_thread(thread_id: str) -> None:
     """Switch to a previous conversation and restore its history."""
     _activate_thread(thread_id)
+
+
+def _delete_thread(thread_id: str) -> None:
+    """Permanently delete a conversation (DB + this session's sidebar)."""
+    delete_thread(thread_id)
+    st.session_state.my_threads = [
+        tid for tid in st.session_state.get("my_threads", []) if tid != thread_id
+    ]
+    if st.session_state.thread_id == thread_id:
+        _new_chat()
 
 
 # ---------- Sidebar ----------
@@ -82,21 +111,56 @@ with st.sidebar:
     st.button("➕ New chat", use_container_width=True, on_click=_new_chat)
 
     st.subheader("Patient profile")
-    name = st.text_input("Name", key="p_name")
-    age = st.number_input(
-        "Age", min_value=0, max_value=130, value=None, step=1, key="p_age"
-    )
-    sex = st.selectbox("Sex", ["", "male", "female", "other"], key="p_sex")
-    weight_kg = st.number_input(
-        "Weight (kg)", min_value=0.0, value=None, key="p_weight"
-    )
-    height_cm = st.number_input(
-        "Height (cm)", min_value=0.0, value=None, key="p_height"
-    )
-    allergies = st.text_input("Allergies (comma-separated)", key="p_allergies")
-    conditions = st.text_input(
-        "Existing conditions (comma-separated)", key="p_conditions"
-    )
+    # A form: the profile only takes effect when "Save profile" is clicked,
+    # not on every keystroke.
+    with st.form("profile_form"):
+        name = st.text_input("Name", key="p_name")
+        age = st.number_input(
+            "Age", min_value=0, max_value=130, value=None, step=1, key="p_age"
+        )
+        sex = st.selectbox("Sex", ["", "male", "female", "other"], key="p_sex")
+        weight_kg = st.number_input(
+            "Weight (kg)", min_value=0.0, value=None, key="p_weight"
+        )
+        height_cm = st.number_input(
+            "Height (cm)", min_value=0.0, value=None, key="p_height"
+        )
+        allergies = st.text_input("Allergies (comma-separated)", key="p_allergies")
+        conditions = st.text_input(
+            "Existing conditions (comma-separated)", key="p_conditions"
+        )
+        save_profile = st.form_submit_button(
+            "💾 Save profile", use_container_width=True
+        )
+
+    if save_profile:
+        # Validate through PatientProfile so out-of-range values (age, weight,
+        # height) never reach the graph; on failure, warn and keep the last
+        # saved profile rather than crashing.
+        try:
+            profile = PatientProfile(
+                name=name,
+                age=age,
+                sex=sex or None,
+                weight_kg=weight_kg or None,
+                height_cm=height_cm or None,
+                allergies=_parse_list(allergies),
+                conditions=_parse_list(conditions),
+            )
+            # Only keep fields the user actually filled in.
+            st.session_state.patient = {
+                key: value for key, value in profile.model_dump().items() if value
+            }
+            if st.session_state.patient:
+                st.success("Profile saved — answers will be personalized.")
+            else:
+                st.info("Profile cleared — answers will be general.")
+        except ValidationError as exc:
+            bad_fields = ", ".join(str(err["loc"][0]) for err in exc.errors())
+            st.warning(
+                f"Profile not saved — invalid value(s) for: {bad_fields}. "
+                "Fix the field(s) and save again."
+            )
 
     st.subheader("📚 Knowledge base")
     st.caption(
@@ -115,57 +179,94 @@ with st.sidebar:
                 dest.write_bytes(file.getbuffer())
                 try:
                     n_chunks = ingest_pdf(dest)
-                    st.toast(f"Indexed {file.name} ({n_chunks} chunks)")
-                except Exception as exc:
-                    st.error(f"Failed to index {file.name}: {exc}")
+                except Exception:
+                    # Corrupt/encrypted/not-really-a-PDF upload: remove the
+                    # saved copy so it doesn't linger in the documents dir.
+                    dest.unlink(missing_ok=True)
+                    st.error(
+                        f"❌ Could not read '{file.name}'. Please provide a "
+                        "correct, uncorrupted PDF file."
+                    )
+                else:
+                    if n_chunks == 0:
+                        # Loaded fine but produced no text — typically a
+                        # scanned/image-only PDF, which can't be indexed.
+                        dest.unlink(missing_ok=True)
+                        st.warning(
+                            f"'{file.name}' contains no readable text (it may "
+                            "be a scanned or image-only PDF). Please provide "
+                            "a correct text-based PDF."
+                        )
+                    else:
+                        st.toast(f"Indexed {file.name} ({n_chunks} chunks)")
     kb_docs = list_documents()
     if kb_docs:
         with st.expander(f"Indexed documents ({len(kb_docs)})"):
             for doc_name in kb_docs:
-                st.markdown(f"- {doc_name}")
+                col_name, col_del = st.columns([5, 1])
+                col_name.markdown(doc_name)
+                if col_del.button(
+                    "🗑️",
+                    key=f"doc_del_{doc_name}",
+                    help=f"Remove '{doc_name}' from the knowledge base",
+                ):
+                    delete_document(doc_name)
+                    (DOCUMENTS_DIR / doc_name).unlink(missing_ok=True)
+                    st.rerun()
 
     st.subheader("Previous chats")
-    threads = list_threads()
-    if not threads:
-        st.caption("No conversations yet.")
-    for tid in threads:
+    # Privacy: list only threads started in THIS browser session — the
+    # checkpoint DB is shared by every visitor of a deployment, so the
+    # global thread list must never be shown.
+    my_threads = st.session_state.get("my_threads", [])
+    shown_any = False
+    for tid in list(my_threads):
         history = get_thread_history(tid)
         first_user_msg = next(
             (m["content"] for m in history if m["role"] == "user"), None
         )
         if first_user_msg is None:
             continue
+        shown_any = True
         label = first_user_msg[:40] + ("…" if len(first_user_msg) > 40 else "")
         is_current = tid == st.session_state.thread_id
-        st.button(
+        col_open, col_del = st.columns([5, 1])
+        col_open.button(
             ("🟢 " if is_current else "💬 ") + label,
             key=f"thread_{tid}",
             use_container_width=True,
             disabled=is_current,
             on_click=_load_thread,
             args=(tid,),
-            help=f"thread_id: {tid}",
         )
+        col_del.button(
+            "🗑️",
+            key=f"del_{tid}",
+            on_click=_delete_thread,
+            args=(tid,),
+            help="Delete this conversation permanently",
+        )
+    if not shown_any:
+        st.caption("No conversations in this session yet.")
 
-# Only include fields the user actually filled in.
-patient = {
-    key: value
-    for key, value in {
-        "name": name,
-        "age": age,
-        "sex": sex or None,
-        "weight_kg": weight_kg,
-        "height_cm": height_cm,
-        "allergies": _parse_list(allergies),
-        "conditions": _parse_list(conditions),
-    }.items()
-    if value
-}
+# The profile only applies once saved via the sidebar's Save button.
+patient = st.session_state.get("patient") or {}
 
 
 # ---------- Chat area ----------
 st.title("MedAssist Chat")
-st.caption(f"Conversation: `{st.session_state.thread_id[:8]}…`")
+
+# First-run hint, shown until the conversation starts.
+if not st.session_state.chat_history:
+    if patient:
+        st.info("✅ Patient profile saved — answers will take it into account.")
+    else:
+        st.info(
+            "👋 **Welcome to MedAssist!** If you'd like answers personalized "
+            "to you, fill in the patient profile in the sidebar and click "
+            "**💾 Save profile** — otherwise, just type your health question "
+            "below to get started."
+        )
 
 for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
@@ -216,10 +317,22 @@ if prompt:
         # emergency path never streams (no LLM), so the generator may
         # finish without yielding anything.
         tokens = _token_stream()
-        with st.spinner("Thinking…"):
-            first_token = next(tokens, None)
-        if first_token is not None:
-            st.write_stream(itertools.chain([first_token], tokens))
+        try:
+            with st.spinner("Thinking…"):
+                first_token = next(tokens, None)
+            if first_token is not None:
+                st.write_stream(itertools.chain([first_token], tokens))
+        except RateLimitError:
+            # The SDK already retried with backoff (max_retries on ChatGroq),
+            # so reaching here means the quota is genuinely exhausted — e.g.
+            # the free tier's daily token cap. Recover instead of crashing.
+            st.session_state.chat_history.pop()
+            st.error(
+                "The AI service is temporarily over its usage limit. "
+                "Please wait a minute and resend your message — if it keeps "
+                "happening, the daily quota may be used up until it resets."
+            )
+            st.stop()
 
         result = app.get_state(config).values
         response = result["final_response"]

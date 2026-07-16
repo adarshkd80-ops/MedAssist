@@ -1,3 +1,5 @@
+# Used by Streamlit Cloud only — local dev uses uv (pyproject.toml + uv.lock).
+# Keep this list in sync with pyproject.toml [project] dependencies.
 langchain
 langgraph
 langgraph-checkpoint-sqlite
