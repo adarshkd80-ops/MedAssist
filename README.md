@@ -45,7 +45,7 @@ graph TD;
 |---|---|
 | `classify_query` | Deterministic red-flag keyword check first (no LLM), then LLM triage with structured output → sets `query_type`, extracts `symptoms`, `symptom_duration`, and `medications` |
 | `emergency_response` | Hardcoded urgent-care message, no LLM — fast and fail-safe |
-| `greeting_response` | Static welcome for greetings/small talk, no LLM |
+| `greeting_response` | Natural small-talk replies on the cheap 8B model (static fallback if the API is down) |
 | `identity_response` | Static "who created you" answer, no LLM |
 | `off_topic_response` | Static refusal for non-medical queries (code, prompt extraction, roleplay), no LLM |
 | `retrieve_context` | RAG retrieval: pulls the top knowledge-base passages relevant to the message (skipped for emergencies) |

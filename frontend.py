@@ -306,7 +306,8 @@ if prompt:
                 stream_mode="messages",
             ):
                 if (
-                    metadata.get("langgraph_node") in ("symptom_checker", "general_answer")
+                    metadata.get("langgraph_node")
+                    in ("symptom_checker", "general_answer", "greeting_response")
                     and isinstance(chunk.content, str)
                     and chunk.content
                 ):

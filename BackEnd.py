@@ -198,11 +198,30 @@ def emergency_response(state: MedState) -> dict:
 
 
 def greeting_response(state: MedState) -> dict:
-    """Static reply for greetings and small talk — no LLM call needed."""
-    return {
-        "final_response": GREETING_RESPONSE,
-        "messages": [("assistant", GREETING_RESPONSE)],
-    }
+    """Natural small talk on the cheap 8B model; static text only as fallback."""
+    try:
+        reply = classifier_llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are MedAssist, a warm, friendly AI health-information "
+                        "assistant. The user is making small talk — a greeting, "
+                        "introducing themselves, thanking you, or saying goodbye. "
+                        "Reply briefly (1-3 sentences) and naturally, like a "
+                        "person would: greet them back, use their name if they "
+                        "shared one, answer pleasantries. Don't repeat the same "
+                        "introduction every time; only mention what you can help "
+                        "with if it fits naturally. "
+                        f"{_patient_context(state)} {GUARDRAILS}"
+                    )
+                ),
+                *_recent_messages(state),
+            ]
+        )
+        response = reply.content
+    except Exception:
+        response = GREETING_RESPONSE
+    return {"final_response": response, "messages": [("assistant", response)]}
 
 
 def identity_response(state: MedState) -> dict:
