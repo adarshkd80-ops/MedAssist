@@ -55,6 +55,16 @@ class PatientProfile(BaseModel):
                     f"A weight of {self.weight_kg:g} kg doesn't match an age of "
                     f"{self.age} — please check both values"
                 )
+        # Height vs weight: a BMI far outside anything humanly recorded
+        # means one of the two values is a typo.
+        if self.height_cm and self.weight_kg:
+            bmi = self.weight_kg / (self.height_cm / 100) ** 2
+            if not 8 <= bmi <= 150:
+                problems.append(
+                    f"A weight of {self.weight_kg:g} kg with a height of "
+                    f"{self.height_cm:g} cm (BMI {bmi:.0f}) is not plausible "
+                    "— please check both values"
+                )
         if problems:
             raise ValueError("; ".join(problems))
         return self
