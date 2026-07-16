@@ -5,6 +5,7 @@ Run with:
 """
 
 import itertools
+import logging
 import uuid
 
 import streamlit as st
@@ -13,6 +14,10 @@ from pydantic import ValidationError
 
 from BackEnd import PatientProfile, app, delete_thread, get_thread_history
 from rag import BACKEND, DOCUMENTS_DIR, delete_document, ingest_pdf, list_documents
+
+# Full tracebacks go to the server log (Manage app → logs on Streamlit
+# Cloud); the UI only ever shows friendly messages.
+logger = logging.getLogger("medassist")
 
 st.set_page_config(page_title="MedAssist", page_icon="🩺", layout="centered")
 
@@ -40,6 +45,15 @@ def _register_thread(thread_id: str) -> None:
     threads.insert(0, thread_id)
 
 
+def _safe_history(thread_id: str) -> list[dict]:
+    """Thread history, or [] if the checkpoint DB can't serve it."""
+    try:
+        return get_thread_history(thread_id)
+    except Exception:
+        logger.exception("failed to load history for thread %s", thread_id)
+        return []
+
+
 def _activate_thread(thread_id: str) -> None:
     """Switch to a conversation and restore its full history."""
     st.session_state.thread_id = thread_id
@@ -50,7 +64,7 @@ def _activate_thread(thread_id: str) -> None:
             "content": msg["content"],
             "emergency": msg["content"].startswith("This may be a medical emergency"),
         }
-        for msg in get_thread_history(thread_id)
+        for msg in _safe_history(thread_id)
     ]
 
 
@@ -92,7 +106,14 @@ def _load_thread(thread_id: str) -> None:
 
 def _delete_thread(thread_id: str) -> None:
     """Permanently delete a conversation (DB + this session's sidebar)."""
-    delete_thread(thread_id)
+    try:
+        delete_thread(thread_id)
+    except Exception:
+        # Runs in a button callback, where st.error can't render — stash
+        # the message and show it on the rerun.
+        logger.exception("failed to delete thread %s", thread_id)
+        st.session_state.flash_error = "Could not delete the conversation. Please try again."
+        return
     st.session_state.my_threads = [
         tid for tid in st.session_state.get("my_threads", []) if tid != thread_id
     ]
@@ -103,6 +124,10 @@ def _delete_thread(thread_id: str) -> None:
 # ---------- Sidebar ----------
 with st.sidebar:
     st.title("🩺 MedAssist")
+    # Errors raised inside button callbacks are shown here on the rerun.
+    flash = st.session_state.pop("flash_error", None)
+    if flash:
+        st.error(flash)
     st.caption(
         "AI health information assistant. Not a substitute for professional "
         "medical advice — in an emergency, call your local emergency number."
@@ -161,6 +186,9 @@ with st.sidebar:
                 f"Profile not saved — invalid value(s) for: {bad_fields}. "
                 "Fix the field(s) and save again."
             )
+        except Exception:
+            logger.exception("failed to save patient profile")
+            st.warning("Profile could not be saved. Please try again.")
 
     st.subheader("📚 Knowledge base")
     st.caption(
@@ -176,10 +204,11 @@ with st.sidebar:
         with st.spinner("Indexing…"):
             for file in uploads:
                 dest = DOCUMENTS_DIR / file.name
-                dest.write_bytes(file.getbuffer())
                 try:
+                    dest.write_bytes(file.getbuffer())
                     n_chunks = ingest_pdf(dest)
                 except Exception:
+                    logger.exception("failed to index %s", file.name)
                     # Corrupt/encrypted/not-really-a-PDF upload: remove the
                     # saved copy so it doesn't linger in the documents dir.
                     dest.unlink(missing_ok=True)
@@ -199,7 +228,12 @@ with st.sidebar:
                         )
                     else:
                         st.toast(f"Indexed {file.name} ({n_chunks} chunks)")
-    kb_docs = list_documents()
+    try:
+        kb_docs = list_documents()
+    except Exception:
+        logger.exception("failed to list knowledge-base documents")
+        kb_docs = []
+        st.warning("The knowledge base is temporarily unavailable.")
     if kb_docs:
         with st.expander(f"Indexed documents ({len(kb_docs)})"):
             for doc_name in kb_docs:
@@ -210,9 +244,14 @@ with st.sidebar:
                     key=f"doc_del_{doc_name}",
                     help=f"Remove '{doc_name}' from the knowledge base",
                 ):
-                    delete_document(doc_name)
-                    (DOCUMENTS_DIR / doc_name).unlink(missing_ok=True)
-                    st.rerun()
+                    try:
+                        delete_document(doc_name)
+                        (DOCUMENTS_DIR / doc_name).unlink(missing_ok=True)
+                    except Exception:
+                        logger.exception("failed to delete document %s", doc_name)
+                        st.error(f"Could not remove '{doc_name}'. Please try again.")
+                    else:
+                        st.rerun()
 
     st.subheader("Previous chats")
     # Privacy: list only threads started in THIS browser session — the
@@ -221,7 +260,7 @@ with st.sidebar:
     my_threads = st.session_state.get("my_threads", [])
     shown_any = False
     for tid in list(my_threads):
-        history = get_thread_history(tid)
+        history = _safe_history(tid)
         first_user_msg = next(
             (m["content"] for m in history if m["role"] == "user"), None
         )
@@ -323,6 +362,13 @@ if prompt:
                 first_token = next(tokens, None)
             if first_token is not None:
                 st.write_stream(itertools.chain([first_token], tokens))
+
+            result = app.get_state(config).values
+            response = result.get("final_response")
+            if not response:
+                # The graph finished without producing an answer — treat it
+                # like any other failure rather than rendering nothing.
+                raise RuntimeError("graph run produced no final_response")
         except RateLimitError:
             # The SDK already retried with backoff (max_retries on ChatGroq),
             # so reaching here means the quota is genuinely exhausted — e.g.
@@ -334,9 +380,17 @@ if prompt:
                 "happening, the daily quota may be used up until it resets."
             )
             st.stop()
+        except Exception:
+            # Last-resort catch: never let an unhandled error take down the
+            # app. Details go to the server log, not the user's screen.
+            logger.exception("chat turn failed")
+            st.session_state.chat_history.pop()
+            st.error(
+                "Sorry, something went wrong while answering. Please resend "
+                "your message — if it keeps happening, start a new chat."
+            )
+            st.stop()
 
-        result = app.get_state(config).values
-        response = result["final_response"]
         is_emergency = result.get("query_type") == "emergency"
         # tool_results persists in the checkpointed thread, so only show it
         # on the turn that actually produced it.
