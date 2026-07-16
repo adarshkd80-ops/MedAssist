@@ -10,7 +10,7 @@ An agentic AI patient Q&A assistant built with **LangGraph** multi-agent orchest
 - **Emergency short-circuit** — red-flag messages skip everything and immediately return an urgent-care warning
 - **Symptom analysis** — extracted symptoms are checked against a red-flag table and the patient's BMI via MCP tools before the LLM drafts a cautious assessment
 - **Web-grounded general answers** — general health questions trigger a DuckDuckGo search; answers cite their source URLs
-- **RAG knowledge base** — upload medical reference PDFs (guidelines, leaflets, formularies) from the sidebar; a `retrieve_context` node grounds both symptom assessments and general answers in the most relevant passages, cited by document and page (Chroma vector store + local Ollama embeddings)
+- **RAG knowledge base** — upload medical reference PDFs (guidelines, leaflets, formularies) from the sidebar; a `retrieve_context` node grounds both symptom assessments and general answers in the most relevant passages, cited by document and page (Chroma vector store; Ollama embeddings locally, with automatic FastEmbed fallback so RAG also works on Streamlit Cloud)
 - **Patient profiles** — age, sex, weight, height, allergies, and conditions are attached to every conversation
 - **Streaming answers** — assistant responses render token-by-token as the LLM generates them
 - **Persistent conversations** — a SQLite checkpointer saves every thread; the app opens on a fresh conversation, and past chats can be reopened from the sidebar
@@ -43,7 +43,16 @@ graph TD;
 
 ### RAG pipeline (`rag.py`)
 
-Uploaded PDFs are split into 1000-character chunks (150 overlap) with `RecursiveCharacterTextSplitter`, embedded locally with Ollama (`nomic-embed-text` by default, configurable via `EMBEDDING_MODEL`), and stored in a persistent Chroma collection (`medassist_kb/`, cosine similarity). At query time the top 4 passages above a relevance threshold are injected into the prompt; re-uploading a file replaces its old chunks. If Ollama is down or nothing relevant is found, the graph degrades gracefully and answers without document grounding.
+Uploaded PDFs are split into 1000-character chunks (150 overlap) with `RecursiveCharacterTextSplitter`, embedded, and stored in a persistent Chroma collection (`medassist_kb/`, cosine similarity). At query time the top 4 passages above a per-model relevance threshold are injected into the prompt; re-uploading a file replaces its old chunks. If nothing relevant is found, the graph degrades gracefully and answers without document grounding.
+
+Two embedding backends are supported, selected automatically at startup (override with `EMBEDDING_BACKEND=ollama|fastembed`):
+
+| Backend | Model | When |
+|---|---|---|
+| `ollama` | `nomic-embed-text` (configurable via `EMBEDDING_MODEL`) | Preferred when a local Ollama server is reachable |
+| `fastembed` | `BAAI/bge-small-en-v1.5` ONNX on CPU (configurable via `FASTEMBED_MODEL`) | Automatic fallback — no server or API key needed, so RAG works on Streamlit Cloud |
+
+Each backend has its own Chroma collection (embedding dimensions differ), so documents indexed locally with Ollama must be re-uploaded on a deployment that uses FastEmbed. The sidebar shows which backend is active.
 
 ### MCP tools (`mcp_server.py`)
 
@@ -65,7 +74,7 @@ The FastMCP server `MedAssist-Tools` exposes five tools, called in-process by th
 | LLM | Groq — Llama 3.3 70B via `langchain-groq` |
 | Tools | FastMCP server + in-process MCP client |
 | Web search | DuckDuckGo (`ddgs`) |
-| RAG | Chroma vector store (`langchain-chroma`) + Ollama embeddings (`nomic-embed-text`) + PyPDF loader |
+| RAG | Chroma vector store (`langchain-chroma`) + Ollama or FastEmbed embeddings + PyPDF loader |
 | Frontend | Streamlit chat UI |
 | Persistence | SQLite (`langgraph-checkpoint-sqlite`) |
 | Observability | LangSmith tracing |
@@ -77,7 +86,7 @@ The FastMCP server `MedAssist-Tools` exposes five tools, called in-process by th
 - Python ≥ 3.13
 - [uv](https://docs.astral.sh/uv/) package manager
 - A [Groq API key](https://console.groq.com/) (free tier available)
-- [Ollama](https://ollama.com/) running locally with the embedding model pulled: `ollama pull nomic-embed-text` (needed for the RAG knowledge base)
+- Optional: [Ollama](https://ollama.com/) running locally with the embedding model pulled (`ollama pull nomic-embed-text`) for higher-quality RAG embeddings — without it, the app falls back to FastEmbed automatically
 - Optional: a [LangSmith API key](https://smith.langchain.com/) for tracing
 
 ### Setup
@@ -93,8 +102,10 @@ Create a `.env` file in the project root:
 ```env
 GROQ_API_KEY="your-groq-key"
 
-# Optional — Ollama embedding model for RAG (default: nomic-embed-text)
-EMBEDDING_MODEL="nomic-embed-text"
+# Optional — RAG embeddings (defaults shown)
+EMBEDDING_BACKEND="auto"              # auto | ollama | fastembed
+EMBEDDING_MODEL="nomic-embed-text"    # Ollama model
+FASTEMBED_MODEL="BAAI/bge-small-en-v1.5"
 
 # Optional — LangSmith tracing
 LANGCHAIN_API_KEY="your-langsmith-key"

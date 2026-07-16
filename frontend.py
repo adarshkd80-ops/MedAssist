@@ -10,7 +10,7 @@ import uuid
 import streamlit as st
 
 from BackEnd import app, get_thread_history, list_threads
-from rag import DOCUMENTS_DIR, ingest_pdf, list_documents
+from rag import BACKEND, DOCUMENTS_DIR, ingest_pdf, list_documents
 
 st.set_page_config(page_title="MedAssist", page_icon="🩺", layout="centered")
 
@@ -101,7 +101,8 @@ with st.sidebar:
     st.subheader("📚 Knowledge base")
     st.caption(
         "Upload medical reference PDFs (guidelines, leaflets, formularies). "
-        "Answers are grounded in these documents when relevant."
+        "Answers are grounded in these documents when relevant. "
+        f"Embeddings: `{BACKEND}`."
     )
     uploads = st.file_uploader(
         "Add PDFs", type="pdf", accept_multiple_files=True, key="kb_uploads"
@@ -116,10 +117,7 @@ with st.sidebar:
                     n_chunks = ingest_pdf(dest)
                     st.toast(f"Indexed {file.name} ({n_chunks} chunks)")
                 except Exception as exc:
-                    st.error(
-                        f"Failed to index {file.name}: {exc}. "
-                        "Is Ollama running with the embedding model pulled?"
-                    )
+                    st.error(f"Failed to index {file.name}: {exc}")
     kb_docs = list_documents()
     if kb_docs:
         with st.expander(f"Indexed documents ({len(kb_docs)})"):

@@ -257,6 +257,10 @@ Graph.add_edge("generate_response", END)
 # FastAPI/Streamlit may touch the connection from different threads.
 conn = sqlite3.connect("medassist_checkpoints.db", check_same_thread=False)
 checkpointer = SqliteSaver(conn)
+# Create the checkpoint tables immediately: SqliteSaver only sets them up on
+# the first write, but list_threads() queries them on startup — on a fresh
+# database (e.g. a new deployment) that would raise sqlite3.OperationalError.
+checkpointer.setup()
 app = Graph.compile(checkpointer=checkpointer)
 
 

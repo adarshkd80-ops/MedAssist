@@ -1,12 +1,21 @@
 """RAG pipeline for MedAssist.
 
 Medical reference PDFs (guidelines, formularies, patient leaflets) are
-ingested into a persistent Chroma vector store using local Ollama
-embeddings. The graph's `retrieve_context` node queries this store to
-ground symptom assessments and general answers in the uploaded documents.
+ingested into a persistent Chroma vector store. The graph's
+`retrieve_context` node queries this store to ground symptom assessments
+and general answers in the uploaded documents.
 
-Requires the Ollama server to be running locally with the embedding
-model pulled (`ollama pull nomic-embed-text`).
+Embedding backends (chosen at startup):
+- **ollama** — local Ollama server with `nomic-embed-text`; preferred when
+  reachable (typical for local development).
+- **fastembed** — ONNX model running on CPU in-process; needs no server or
+  API key, so it is the automatic fallback on deployments like Streamlit
+  Cloud where Ollama does not exist.
+
+Each backend writes to its own Chroma collection: vectors from different
+embedding models have different dimensions and are not comparable, so a
+knowledge base indexed with one backend must be re-indexed to be visible
+to the other.
 """
 
 import os
@@ -15,7 +24,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langsmith import traceable
 
@@ -23,17 +31,53 @@ load_dotenv()
 
 DOCUMENTS_DIR = Path(__file__).parent / "documents"
 PERSIST_DIR = str(Path(__file__).parent / "medassist_kb")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+
+OLLAMA_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+FASTEMBED_MODEL = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
+# "auto" prefers Ollama and falls back to FastEmbed; set to "ollama" or
+# "fastembed" to force one backend.
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "auto").lower()
+
+
+def _ollama_embeddings():
+    from langchain_ollama import OllamaEmbeddings
+
+    embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
+    # OllamaEmbeddings connects lazily; embed something now so an
+    # unreachable server fails here, where "auto" can still fall back.
+    embeddings.embed_query("ping")
+    return embeddings
+
+
+def _fastembed_embeddings():
+    from langchain_community.embeddings import FastEmbedEmbeddings
+
+    return FastEmbedEmbeddings(model_name=FASTEMBED_MODEL)
+
+
+def _select_backend() -> tuple[str, object]:
+    if EMBEDDING_BACKEND == "ollama":
+        return "ollama", _ollama_embeddings()
+    if EMBEDDING_BACKEND == "fastembed":
+        return "fastembed", _fastembed_embeddings()
+    try:
+        return "ollama", _ollama_embeddings()
+    except Exception:
+        return "fastembed", _fastembed_embeddings()
+
+
+BACKEND, _embeddings = _select_backend()
 
 # Passages scoring below this cosine relevance are treated as noise and
-# dropped rather than stuffed into the prompt. Calibrated for
-# nomic-embed-text: off-topic queries score ~0.33, on-topic ones 0.7+.
-MIN_RELEVANCE = 0.45
-
-_embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+# dropped rather than stuffed into the prompt. Calibrated per model:
+# nomic-embed-text scores off-topic ~0.33 / on-topic 0.7+; bge-small
+# scores off-topic ~0.46 / on-topic 0.6+.
+MIN_RELEVANCE = {"ollama": 0.45, "fastembed": 0.55}[BACKEND]
 
 vector_store = Chroma(
-    collection_name="medassist_kb",
+    # The original (Ollama-era) collection keeps its name so existing local
+    # knowledge bases stay intact.
+    collection_name="medassist_kb" if BACKEND == "ollama" else "medassist_kb_fastembed",
     embedding_function=_embeddings,
     persist_directory=PERSIST_DIR,
     collection_metadata={"hnsw:space": "cosine"},
