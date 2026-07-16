@@ -25,6 +25,7 @@ An agentic AI patient Q&A assistant built with **LangGraph** multi-agent orchest
 graph TD;
     START([START]) --> classify_query
     classify_query -. emergency .-> emergency_response
+    classify_query -. greeting .-> greeting_response
     classify_query -. identity .-> identity_response
     classify_query -. off_topic .-> off_topic_response
     classify_query -. symptom .-> retrieve_context
@@ -34,6 +35,7 @@ graph TD;
     symptom_checker --> generate_response
     general_answer --> generate_response
     emergency_response --> END_([END])
+    greeting_response --> END_
     identity_response --> END_
     off_topic_response --> END_
     generate_response --> END_
@@ -43,6 +45,7 @@ graph TD;
 |---|---|
 | `classify_query` | Deterministic red-flag keyword check first (no LLM), then LLM triage with structured output → sets `query_type`, extracts `symptoms`, `symptom_duration`, and `medications` |
 | `emergency_response` | Hardcoded urgent-care message, no LLM — fast and fail-safe |
+| `greeting_response` | Static welcome for greetings/small talk, no LLM |
 | `identity_response` | Static "who created you" answer, no LLM |
 | `off_topic_response` | Static refusal for non-medical queries (code, prompt extraction, roleplay), no LLM |
 | `retrieve_context` | RAG retrieval: pulls the top knowledge-base passages relevant to the message (skipped for emergencies) |
