@@ -11,7 +11,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langsmith import traceable
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from mcp_server import RED_FLAG_SYMPTOMS
 from mcp_server import mcp as med_tools_server
@@ -27,10 +27,37 @@ class PatientProfile(BaseModel):
     name: str = ""
     age: Optional[int] = Field(default=None, ge=0, le=130)
     sex: Optional[str] = None
-    weight_kg: Optional[float] = Field(default=None, gt=0)
-    height_cm: Optional[float] = Field(default=None, gt=0)
+    # Upper bounds are generous human maxima; anything beyond is a typo.
+    weight_kg: Optional[float] = Field(default=None, gt=0, le=500)
+    height_cm: Optional[float] = Field(default=None, gt=0, le=250)
     allergies: list[str] = Field(default_factory=list, description="Known allergies (drugs, food, environmental)")
     conditions: list[str] = Field(default_factory=list, description="Pre-existing diagnosed conditions")
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> "PatientProfile":
+        """Cross-field sanity: individually valid values can still be an
+        obvious typo when combined (e.g. age 3 with height 190 cm)."""
+        problems: list[str] = []
+        if self.age is not None:
+            if self.age < 2:
+                max_height, max_weight = 110, 25
+            elif self.age < 12:
+                max_height, max_weight = 180, 120
+            else:
+                max_height = max_weight = None
+            if max_height and self.height_cm and self.height_cm > max_height:
+                problems.append(
+                    f"A height of {self.height_cm:g} cm doesn't match an age of "
+                    f"{self.age} — please check both values"
+                )
+            if max_weight and self.weight_kg and self.weight_kg > max_weight:
+                problems.append(
+                    f"A weight of {self.weight_kg:g} kg doesn't match an age of "
+                    f"{self.age} — please check both values"
+                )
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
 
 
 

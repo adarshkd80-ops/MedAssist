@@ -140,9 +140,9 @@ with st.sidebar:
     # not on every keystroke.
     with st.form("profile_form"):
         name = st.text_input("Name", key="p_name")
-        age = st.number_input(
-            "Age", min_value=0, max_value=130, value=None, step=1, key="p_age"
-        )
+        # No widget-level max: out-of-range values get an explicit warning
+        # on Save (below) instead of being silently blocked while typing.
+        age = st.number_input("Age", min_value=0, value=None, step=1, key="p_age")
         sex = st.selectbox("Sex", ["", "male", "female", "other"], key="p_sex")
         weight_kg = st.number_input(
             "Weight (kg)", min_value=0.0, value=None, key="p_weight"
@@ -181,10 +181,27 @@ with st.sidebar:
             else:
                 st.info("Profile cleared — answers will be general.")
         except ValidationError as exc:
-            bad_fields = ", ".join(str(err["loc"][0]) for err in exc.errors())
+            # Name each bad field with its allowed range so the user knows
+            # exactly what to correct.
+            hints = {
+                "age": "Age must be between 0 and 130 years",
+                "weight_kg": "Weight must be between 1 and 500 kg",
+                "height_cm": "Height must be between 1 and 250 cm",
+            }
+            problems = set()
+            for err in exc.errors():
+                if err["loc"]:
+                    field = str(err["loc"][0])
+                    problems.add(hints.get(field, f"'{field}' is invalid"))
+                else:
+                    # Cross-field consistency errors carry their own message
+                    # and no field location.
+                    problems.add(err["msg"].removeprefix("Value error, "))
+            problems = sorted(problems)
             st.warning(
-                f"Profile not saved — invalid value(s) for: {bad_fields}. "
-                "Fix the field(s) and save again."
+                "⚠️ Profile not saved:\n\n"
+                + "\n".join(f"- {p}" for p in problems)
+                + "\n\nPlease correct the value(s) and save again."
             )
         except Exception:
             logger.exception("failed to save patient profile")
