@@ -6,7 +6,8 @@ An agentic AI patient Q&A assistant built with **LangGraph** multi-agent orchest
 
 ## ✨ Features
 
-- **LLM triage** — every message is classified as `symptom`, `general`, `emergency`, `identity`, or `off_topic` using structured output (Pydantic) on Groq's Llama 3.1 8B (answers use Llama 3.3 70B; splitting models spreads load across Groq's per-model rate limits)
+- **LLM triage** — every message is classified as `symptom`, `general`, `emergency`, `greeting`, `identity`, or `off_topic` using structured output (Pydantic)
+- **One model per task** — each task runs on the cheapest Groq model that's good enough, each with its own rate-limit quota (override via `MODEL_*` env vars): triage & small talk on `llama-3.1-8b-instant`, symptom assessment on `llama-3.3-70b-versatile`, general Q&A on `openai/gpt-oss-120b`; if an answer model fails, the other answer model steps in automatically
 - **Deterministic emergency short-circuit** — red-flag keywords are checked *before* any LLM call, so messages like "crushing chest pain" get the urgent-care warning even if the LLM is down or rate-limited
 - **Guardrails** — non-medical queries (programming, prompt-extraction attempts, roleplay) are refused without spending LLM tokens, and every answering prompt carries injection-resistant rules
 - **Medication safety** — medications mentioned in a message are looked up in the local formulary and checked against the patient's saved allergies (incl. cross-reactions like aspirin ↔ ibuprofen)
@@ -83,7 +84,7 @@ The FastMCP server `MedAssist-Tools` exposes five tools, called in-process by th
 | Layer | Technology |
 |---|---|
 | Orchestration | LangGraph (`StateGraph`, conditional edges, SQLite checkpointer) |
-| LLM | Groq via `langchain-groq` — Llama 3.3 70B (answers), Llama 3.1 8B (triage) |
+| LLM | Groq via `langchain-groq` — one model per task (see below), each on its own rate-limit quota |
 | Tools | FastMCP server + in-process MCP client |
 | Web search | DuckDuckGo (`ddgs`) |
 | RAG | Chroma vector store (`langchain-chroma`) + Ollama or FastEmbed embeddings + PyPDF loader |

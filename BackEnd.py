@@ -52,16 +52,40 @@ class MedState(TypedDict):
     final_response: str
 
 
-# max_retries: the Groq SDK backs off and honors Retry-After on 429s, so
-# brief per-minute rate-limit hits recover on their own instead of crashing.
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY, max_retries=5)
+def _groq_llm(model: str) -> ChatGroq:
+    # max_retries: the Groq SDK backs off and honors Retry-After on 429s, so
+    # brief per-minute rate-limit hits recover on their own.
+    return ChatGroq(model=model, api_key=GROQ_API_KEY, max_retries=5)
 
-# Triage runs on a small, fast model: classification doesn't need 70B, and
-# Groq rate limits are per model — this halves the traffic on the big
-# model's quota, and the 8B free tier allows ~5x more tokens per day.
-classifier_llm = ChatGroq(
-    model="llama-3.1-8b-instant", api_key=GROQ_API_KEY, max_retries=5
-)
+
+# Each task runs on its own model (override any of these via env vars).
+# Groq rate limits are per model, so spreading tasks across models spreads
+# the traffic over separate quotas — and each task gets the cheapest model
+# that is good enough for it.
+MODELS = {
+    # Trivial structured classification: fastest model, biggest quota.
+    "classifier": os.getenv("MODEL_CLASSIFIER", "llama-3.1-8b-instant"),
+    # Short small talk: same cheap model.
+    "greeting": os.getenv("MODEL_GREETING", "llama-3.1-8b-instant"),
+    # Symptom assessment is the safety-critical task: strongest reasoning.
+    "symptom": os.getenv("MODEL_SYMPTOM", "llama-3.3-70b-versatile"),
+    # General health Q&A: strong model on a separate quota from symptom.
+    "general": os.getenv("MODEL_GENERAL", "openai/gpt-oss-120b"),
+}
+
+classifier_llm = _groq_llm(MODELS["classifier"])
+greeting_llm = _groq_llm(MODELS["greeting"])
+symptom_llm = _groq_llm(MODELS["symptom"])
+general_llm = _groq_llm(MODELS["general"])
+
+
+def _invoke_with_fallback(primary: ChatGroq, fallback: ChatGroq, messages) -> str:
+    """Answer with the task's model; if it fails (e.g. its quota is spent),
+    retry once on the other answer model before giving up."""
+    try:
+        return primary.invoke(messages).content
+    except Exception:
+        return fallback.invoke(messages).content
 
 # Only the most recent messages are sent to the LLMs; the full conversation
 # stays in the checkpoint DB. Keeps long chats from eating the token quota.
@@ -208,9 +232,9 @@ def emergency_response(state: MedState) -> dict:
 
 
 def greeting_response(state: MedState) -> dict:
-    """Natural small talk on the cheap 8B model; static text only as fallback."""
+    """Natural small talk on the cheap greeting model; static text as fallback."""
     try:
-        reply = classifier_llm.invoke(
+        reply = greeting_llm.invoke(
             [
                 SystemMessage(
                     content=(
@@ -316,7 +340,9 @@ def symptom_checker(state: MedState) -> dict:
             tool_results["bmi"] = f"unavailable (calculation failed: {exc})"
     if state.get("medications"):
         tool_results["medications"] = _medication_tools(patient, state["medications"])
-    assessment = llm.invoke(
+    assessment = _invoke_with_fallback(
+        symptom_llm,
+        general_llm,
         [
             SystemMessage(
                 content=(
@@ -339,7 +365,7 @@ def symptom_checker(state: MedState) -> dict:
     # the passages reach the prompt only once, via _kb_context.
     if state.get("retrieved_docs"):
         tool_results["knowledge_base"] = state["retrieved_docs"]
-    return {"tool_results": tool_results, "final_response": assessment.content}
+    return {"tool_results": tool_results, "final_response": assessment}
 
 
 def general_answer(state: MedState) -> dict:
@@ -355,7 +381,9 @@ def general_answer(state: MedState) -> dict:
             state.get("patient") or {}, state["medications"]
         )
 
-    answer = llm.invoke(
+    answer = _invoke_with_fallback(
+        general_llm,
+        symptom_llm,
         [
             SystemMessage(
                 content=(
@@ -378,7 +406,7 @@ def general_answer(state: MedState) -> dict:
     )
     if state.get("retrieved_docs"):
         tool_results["knowledge_base"] = state["retrieved_docs"]
-    return {"tool_results": tool_results, "final_response": answer.content}
+    return {"tool_results": tool_results, "final_response": answer}
 
 
 def generate_response(state: MedState) -> dict:
