@@ -13,4 +13,8 @@ wheels/
 .env
 
 # Local conversation database (patient chat history)
-medassist_checkpoints.db
+medassist_checkpoints.db*
+
+# RAG knowledge base — vector store and uploaded PDFs
+medassist_kb/
+documents/

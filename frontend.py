@@ -4,11 +4,13 @@ Run with:
     uv run streamlit run frontend.py
 """
 
+import itertools
 import uuid
 
 import streamlit as st
 
 from BackEnd import app, get_thread_history, list_threads
+from rag import DOCUMENTS_DIR, ingest_pdf, list_documents
 
 st.set_page_config(page_title="MedAssist", page_icon="🩺", layout="centered")
 
@@ -37,16 +39,13 @@ def _activate_thread(thread_id: str) -> None:
 
 
 # ---------- Session state ----------
-# One conversation = one thread_id. On startup, resume the thread from the
-# URL (?thread=...) if present, otherwise the most recent saved conversation.
-# Only the "New chat" button creates a fresh thread_id.
+# One conversation = one thread_id. Every app launch starts a fresh
+# conversation; a page refresh stays in the current one via the URL
+# (?thread=...), and old chats can be reopened from the sidebar.
 if "thread_id" not in st.session_state:
     requested = st.query_params.get("thread")
-    saved_threads = list_threads()
     if requested:
         _activate_thread(requested)
-    elif saved_threads:
-        _activate_thread(saved_threads[0])
     else:
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.chat_history = []
@@ -98,6 +97,34 @@ with st.sidebar:
     conditions = st.text_input(
         "Existing conditions (comma-separated)", key="p_conditions"
     )
+
+    st.subheader("📚 Knowledge base")
+    st.caption(
+        "Upload medical reference PDFs (guidelines, leaflets, formularies). "
+        "Answers are grounded in these documents when relevant."
+    )
+    uploads = st.file_uploader(
+        "Add PDFs", type="pdf", accept_multiple_files=True, key="kb_uploads"
+    )
+    if uploads and st.button("Index documents", use_container_width=True):
+        DOCUMENTS_DIR.mkdir(exist_ok=True)
+        with st.spinner("Indexing…"):
+            for file in uploads:
+                dest = DOCUMENTS_DIR / file.name
+                dest.write_bytes(file.getbuffer())
+                try:
+                    n_chunks = ingest_pdf(dest)
+                    st.toast(f"Indexed {file.name} ({n_chunks} chunks)")
+                except Exception as exc:
+                    st.error(
+                        f"Failed to index {file.name}: {exc}. "
+                        "Is Ollama running with the embedding model pulled?"
+                    )
+    kb_docs = list_documents()
+    if kb_docs:
+        with st.expander(f"Indexed documents ({len(kb_docs)})"):
+            for doc_name in kb_docs:
+                st.markdown(f"- {doc_name}")
 
     st.subheader("Previous chats")
     threads = list_threads()
@@ -160,18 +187,43 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            config = {
-                "configurable": {"thread_id": st.session_state.thread_id},
-                # Groups traces into conversations in LangSmith's Threads view.
-                "metadata": {"thread_id": st.session_state.thread_id},
-                "run_name": "medassist-chat",
-            }
-            result = app.invoke(
+        config = {
+            "configurable": {"thread_id": st.session_state.thread_id},
+            # Groups traces into conversations in LangSmith's Threads view.
+            "metadata": {"thread_id": st.session_state.thread_id},
+            "run_name": "medassist-chat",
+        }
+
+        def _token_stream():
+            """Yield answer tokens as the graph's LLM calls generate them.
+
+            stream_mode="messages" surfaces every LLM token in the graph;
+            filtering by node keeps the triage classifier's structured
+            output out of the visible answer.
+            """
+            for chunk, metadata in app.stream(
                 {"messages": [("user", prompt)], "patient": patient},
                 config,
-            )
+                stream_mode="messages",
+            ):
+                if (
+                    metadata.get("langgraph_node") in ("symptom_checker", "general_answer")
+                    and isinstance(chunk.content, str)
+                    and chunk.content
+                ):
+                    yield chunk.content
 
+        # Spinner covers the silent phase (triage + tool calls); once the
+        # first token arrives, hand the stream to st.write_stream. The
+        # emergency path never streams (no LLM), so the generator may
+        # finish without yielding anything.
+        tokens = _token_stream()
+        with st.spinner("Thinking…"):
+            first_token = next(tokens, None)
+        if first_token is not None:
+            st.write_stream(itertools.chain([first_token], tokens))
+
+        result = app.get_state(config).values
         response = result["final_response"]
         is_emergency = result.get("query_type") == "emergency"
         # tool_results persists in the checkpointed thread, so only show it
@@ -182,9 +234,12 @@ if prompt:
             else None
         )
 
+        # The normal answer was already rendered token-by-token above; only
+        # the emergency banner (or a stream that produced nothing) still
+        # needs to be drawn here.
         if is_emergency:
             st.error(response)
-        else:
+        elif first_token is None:
             st.markdown(response)
         if tool_results:
             with st.expander("🔧 MCP tool results"):

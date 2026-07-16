@@ -3,9 +3,6 @@ from langgraph.graph import StateGraph,START,END
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
-from langchain_classic.text_splitter import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import SystemMessage
 from dotenv import load_dotenv
 import sqlite3
@@ -14,6 +11,7 @@ import asyncio
 from fastmcp import Client
 from langsmith import traceable
 from mcp_server import mcp as med_tools_server
+from rag import format_context, retrieve
 
 
 
@@ -49,6 +47,7 @@ class MedState(TypedDict):
     symptoms: list[str]
     symptom_duration: Optional[str]
     tool_results: dict       # raw outputs from the MCP tools
+    retrieved_docs: list     # knowledge-base passages from the RAG retriever
     final_response: str
 
 
@@ -118,6 +117,28 @@ def emergency_response(state: MedState) -> dict:
     return {"final_response": response, "messages": [("assistant", response)]}
 
 
+def retrieve_context(state: MedState) -> dict:
+    """RAG node: pull relevant knowledge-base passages for the user's message.
+
+    Runs before both the symptom and general paths. Returns [] when the
+    knowledge base is empty or nothing relevant is found, in which case
+    the downstream nodes answer without document grounding.
+    """
+    query = state["messages"][-1].content
+    return {"retrieved_docs": retrieve(query)}
+
+
+def _kb_context(state: MedState) -> str:
+    """Prompt block for retrieved passages, or a note that none were found."""
+    context = format_context(state.get("retrieved_docs") or [])
+    if not context:
+        return "No relevant passages were found in the local knowledge base."
+    return (
+        "Relevant passages from the local medical knowledge base — prefer these "
+        "over general knowledge and cite them as (source, page):\n" + context
+    )
+
+
 def symptom_checker(state: MedState) -> dict:
     """Analyze extracted symptoms using the MCP tools + patient profile."""
     patient = state.get("patient") or {}
@@ -133,7 +154,6 @@ def symptom_checker(state: MedState) -> dict:
             "calculate_bmi",
             {"weight_kg": patient["weight_kg"], "height_cm": patient["height_cm"]},
         )
-
     assessment = llm.invoke(
         [
             SystemMessage(
@@ -145,17 +165,22 @@ def symptom_checker(state: MedState) -> dict:
                     "lead with that warning. Never diagnose or prescribe. "
                     f"{_patient_context(state)} "
                     f"Symptoms: {symptoms}; duration: {state.get('symptom_duration')}. "
-                    f"Tool results: {tool_results}"
+                    f"Tool results: {tool_results} "
+                    f"{_kb_context(state)}"
                 )
             ),
             *state["messages"],
         ]
     )
+    # Shown in the UI's tool-results expander; added after the LLM call so
+    # the passages reach the prompt only once, via _kb_context.
+    if state.get("retrieved_docs"):
+        tool_results["knowledge_base"] = state["retrieved_docs"]
     return {"tool_results": tool_results, "final_response": assessment.content}
 
 
 def general_answer(state: MedState) -> dict:
-    """Answer general health / medication questions using DuckDuckGo search."""
+    """Answer general health / medication questions using RAG + web search."""
     question = state["messages"][-1].content
     search = call_mcp_tool("web_search", {"query": question, "max_results": 5})
     tool_results = {"web_search": search}
@@ -166,16 +191,19 @@ def general_answer(state: MedState) -> dict:
                 content=(
                     "You are a medical information assistant. Answer general health questions "
                     "accurately and simply, remind the user you are not a substitute for a "
-                    "clinician. Use the web search results below to ground your answer in "
-                    "current information, and cite the source URLs you relied on. If the "
-                    "results are empty or irrelevant, answer from your own knowledge and "
+                    "clinician. Ground your answer in the knowledge-base passages and web "
+                    "search results below, citing document sources and URLs you relied on. "
+                    "If both are empty or irrelevant, answer from your own knowledge and "
                     f"say so. {_patient_context(state)} "
+                    f"{_kb_context(state)} "
                     f"Web search results: {search}"
                 )
             ),
             *state["messages"],
         ]
     )
+    if state.get("retrieved_docs"):
+        tool_results["knowledge_base"] = state["retrieved_docs"]
     return {"tool_results": tool_results, "final_response": answer.content}
 
 
@@ -193,17 +221,28 @@ def route_query(state: MedState) -> str:
 Graph = StateGraph(MedState)
 Graph.add_node("classify_query", classify_query)
 Graph.add_node("emergency_response", emergency_response)
+Graph.add_node("retrieve_context", retrieve_context)
 Graph.add_node("symptom_checker", symptom_checker)
 Graph.add_node("general_answer", general_answer)
 Graph.add_node("generate_response", generate_response)
 
 ## Wiring Edges
 Graph.add_edge(START, "classify_query")
+# Emergencies skip retrieval entirely; everything else is grounded in the
+# knowledge base first, then routed to its specialist node.
 Graph.add_conditional_edges(
     "classify_query",
     route_query,
     {
         "emergency": "emergency_response",
+        "symptom": "retrieve_context",
+        "general": "retrieve_context",
+    },
+)
+Graph.add_conditional_edges(
+    "retrieve_context",
+    route_query,
+    {
         "symptom": "symptom_checker",
         "general": "general_answer",
     },
